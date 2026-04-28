@@ -1,0 +1,751 @@
+🏠 我的待办主页
+
+```dataviewjs
+/* ============================================================
+   一体化主页：四象限 + 日历 + 弹窗表单 + 拖拽 + 过滤
+   依赖：仅 Dataview（启用 JavaScript Queries）
+   ============================================================ */
+
+/* ⚠️ 改成你 Inbox.md 的实际路径（含文件夹）⚠️
+   例：根目录就放 "Inbox.md"
+   在 待办 文件夹下就 "待办/Inbox.md" */
+const SRC_PATH = "待办/Inbox.md";
+
+const COLORS = { Q1:"#e74c3c", Q2:"#e67e22", Q3:"#f1c40f", Q4:"#95a5a6" };
+
+/* ---------- 工具 ---------- */
+const pad = n => String(n).padStart(2,"0");
+const todayDV = dv.date('today');
+const nowDV   = dv.date('now');
+const todayStr = todayDV.toFormat("yyyy-MM-dd");
+
+const isImportant = t => t.important === true;
+const isUrgent    = t => t.urgent === true;
+const within12h = t => {
+  if (!t.due) return false;
+  const d = dv.date(String(t.due).replace(" ","T"));
+  if (!d) return false;
+  const h = (d.ts - nowDV.ts)/3600000;
+  return h > 0 && h < 12;
+};
+const quadrant = t => {
+  const imp = isImportant(t);
+  const urg = isUrgent(t) || within12h(t);
+  if (imp && urg) return "Q1";
+  if (imp) return "Q2";
+  if (urg) return "Q3";
+  return "Q4";
+};
+const fmtDate = d => d ? String(d).slice(0,10) : null;
+
+const byDue = (a,b) => {
+  if (!a.due && !b.due) return 0;
+  if (!a.due) return 1;
+  if (!b.due) return -1;
+  return dv.date(String(a.due).replace(" ","T")).ts
+       - dv.date(String(b.due).replace(" ","T")).ts;
+};
+
+/* ---------- 文件读写（核心，不依赖 dv.pages） ---------- */
+async function readInbox() {
+  const file = app.vault.getAbstractFileByPath(SRC_PATH);
+  if (!file) {
+    throw new Error(`找不到文件：${SRC_PATH}\n请修改代码顶部的 SRC_PATH 变量。`);
+  }
+  const text = await app.vault.read(file);
+  return { file, text, lines: text.split("\n") };
+}
+
+function parseTaskLine(line) {
+  if (!/^\s*-\s*\[[ xX]\]/.test(line)) return null;
+  const completed = /^\s*-\s*\[[xX]\]/.test(line);
+  const get = (k) => {
+    const m = line.match(new RegExp(`\\[${k}::\\s*([^\\]]*)\\]`));
+    return m ? m[1].trim() : "";
+  };
+  const text = line
+    .replace(/^\s*-\s*\[[ xX]\]\s*/, "")
+    .replace(/\[[^\[\]]*?::[^\[\]]*?\]/g, "")
+    .trim();
+  return {
+    completed,
+    text,
+    important: get("important") === "true",
+    urgent:    get("urgent") === "true",
+    due:       get("due"),
+    created:   get("created"),
+    done:      get("done"),
+    modified:  get("modified"),
+    repeat:    get("repeat"),
+  };
+}
+
+function buildTaskLine(t) {
+  const box = t.completed ? "[x]" : "[ ]";
+  const fields = [
+    `[important:: ${t.important ? "true":"false"}]`,
+    `[urgent:: ${t.urgent ? "true":"false"}]`,
+    `[due:: ${t.due || ""}]`,
+    `[created:: ${t.created || todayStr}]`,
+    t.done     ? `[done:: ${t.done}]` : "",
+    t.modified ? `[modified:: ${t.modified}]` : "",
+    `[repeat:: ${t.repeat || ""}]`,
+  ].filter(Boolean).join(" ");
+  return `- ${box} ${t.text} ${fields}`;
+}
+
+async function writeTaskAtIndex(idx, taskObj) {
+  const { file, lines } = await readInbox();
+  lines[idx] = buildTaskLine(taskObj);
+  await app.vault.modify(file, lines.join("\n"));
+}
+async function appendTask(taskObj) {
+  const { file, text } = await readInbox();
+  const newText = text.replace(/\s*$/, "") + "\n" + buildTaskLine(taskObj) + "\n";
+  await app.vault.modify(file, newText);
+}
+async function deleteTaskAtIndex(idx) {
+  const { file, lines } = await readInbox();
+  lines.splice(idx, 1);
+  await app.vault.modify(file, lines.join("\n"));
+}
+
+async function loadTasks() {
+  const { lines } = await readInbox();
+  const tasks = [];
+  lines.forEach((line, idx) => {
+    const parsed = parseTaskLine(line);
+    if (parsed) tasks.push({ idx, raw: line, ...parsed });
+  });
+  return tasks;
+}
+
+/* ============================================================
+   CSS
+   ============================================================ */
+const CSS = `
+.todo-tabs{display:flex;gap:6px;margin:8px 0 12px;flex-wrap:wrap;}
+.todo-tabs button{padding:6px 14px;border:1px solid var(--background-modifier-border);
+  border-radius:8px;background:var(--background-secondary);cursor:pointer;font-size:0.95em;}
+.todo-tabs button.active{background:var(--interactive-accent);color:white;border-color:transparent;}
+.todo-toolbar{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center;}
+.todo-btn{padding:6px 12px;border-radius:6px;border:1px solid var(--background-modifier-border);
+  background:var(--background-secondary);cursor:pointer;font-size:0.9em;}
+.todo-btn.primary{background:var(--interactive-accent);color:white;border-color:transparent;}
+.todo-btn.active{background:var(--interactive-accent);color:white;border-color:transparent;}
+.todo-toolbar .switch{display:flex;align-items:center;gap:5px;font-size:0.88em;margin-left:6px;}
+
+.todo-status{padding:6px 10px;border-radius:6px;background:var(--background-secondary);
+  font-size:0.82em;color:var(--text-muted);margin-bottom:8px;}
+.todo-error{background:#fdecea;color:#922;border:1px solid #f5c6c6;}
+
+/* 四象限 */
+.q-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+@media (max-width:700px){.q-grid{grid-template-columns:1fr;}}
+.q-box{border:1px solid var(--background-modifier-border);border-radius:10px;overflow:hidden;}
+.q-head{padding:8px 12px;color:white;font-weight:600;display:flex;justify-content:space-between;align-items:center;}
+.q-body{padding:6px 10px;min-height:60px;}
+.q-body.drop-hover{background:var(--background-modifier-hover);}
+.q-item{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px dashed var(--background-modifier-border);}
+.q-item:last-child{border-bottom:none;}
+.q-item.dragging{opacity:0.4;}
+.q-item .q-cb{margin-top:3px;}
+.q-item .q-text{flex:1;cursor:grab;}
+.q-item .q-meta{font-size:0.78em;opacity:0.7;margin-top:2px;}
+.q-item .q-edit{cursor:pointer;font-size:0.85em;padding:2px 8px;border-radius:4px;
+  background:var(--background-secondary);border:1px solid var(--background-modifier-border);}
+.q-item.done .q-text{text-decoration:line-through;opacity:0.55;}
+.q-empty{color:var(--text-muted);font-size:0.85em;padding:6px;}
+.q-divider{margin:8px 0 4px;padding:3px 6px;font-size:0.75em;color:var(--text-muted);
+  border-top:1px dashed var(--background-modifier-border);text-align:center;letter-spacing:1px;}
+
+/* 日历 */
+.cal-nav{display:flex;gap:8px;align-items:center;margin:6px 0 8px;flex-wrap:wrap;}
+.cal-title{font-weight:600;font-size:1.05em;}
+.cal-table{width:100%;border-collapse:collapse;table-layout:fixed;}
+.cal-table th{padding:5px;background:var(--background-secondary);
+  border:1px solid var(--background-modifier-border);font-size:0.85em;}
+.cal-cell{vertical-align:top;border:1px solid var(--background-modifier-border);
+  height:84px;padding:3px;cursor:pointer;position:relative;}
+.cal-cell:hover{background:var(--background-modifier-hover);}
+.cal-empty{border:1px solid var(--background-modifier-border);background:var(--background-primary-alt);}
+.cal-day{font-weight:600;font-size:0.82em;margin-bottom:2px;}
+.cal-today{display:inline-block;background:var(--interactive-accent);color:white;
+  border-radius:50%;width:20px;height:20px;text-align:center;line-height:20px;}
+.cal-item{font-size:0.7em;color:white;padding:1px 4px;margin:1px 0;border-radius:3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;}
+
+/* 弹窗 */
+.todo-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9998;
+  display:flex;align-items:center;justify-content:center;}
+.todo-modal{background:var(--background-primary);border-radius:12px;
+  padding:18px;min-width:300px;max-width:92vw;width:420px;
+  box-shadow:0 12px 40px rgba(0,0,0,0.4);z-index:9999;}
+.todo-modal h3{margin:0 0 12px;}
+.todo-modal label{display:block;margin:8px 0 4px;font-size:0.88em;font-weight:600;}
+.todo-modal input[type=text],
+.todo-modal input[type=date],
+.todo-modal input[type=datetime-local],
+.todo-modal select{width:100%;padding:6px 8px;border-radius:6px;
+  border:1px solid var(--background-modifier-border);background:var(--background-secondary);
+  color:var(--text-normal);box-sizing:border-box;}
+.todo-modal .row{display:flex;gap:10px;}
+.todo-modal .row > div{flex:1;}
+.todo-modal .checks{display:flex;gap:14px;margin-top:6px;flex-wrap:wrap;}
+.todo-modal .checks label{display:flex;align-items:center;gap:5px;font-weight:normal;margin:0;}
+.todo-modal .actions{display:flex;justify-content:space-between;margin-top:16px;gap:8px;}
+.todo-modal .actions button{padding:7px 14px;border-radius:6px;border:1px solid var(--background-modifier-border);
+  background:var(--background-secondary);cursor:pointer;}
+.todo-modal .actions .save{background:var(--interactive-accent);color:white;border-color:transparent;}
+.todo-modal .actions .del{background:#c0392b;color:white;border-color:transparent;}
+`;
+const styleEl = document.createElement("style");
+styleEl.textContent = CSS;
+dv.container.appendChild(styleEl);
+
+/* ============================================================
+   弹窗表单
+   ============================================================ */
+function openTaskModal({ mode, task, idx, defaultDate, onSaved }) {
+  const bg = document.createElement("div");
+  bg.className = "todo-modal-bg";
+  document.body.appendChild(bg);
+
+  const m = document.createElement("div");
+  m.className = "todo-modal";
+  bg.appendChild(m);
+
+  const t = task || {
+    text:"", important:false, urgent:false,
+    due: defaultDate || "", created: todayStr, repeat:"", completed:false,
+  };
+
+  m.innerHTML = `
+    <h3>${mode === "edit" ? "✍️ 编辑任务" : "➕ 新建任务"}</h3>
+    <label>任务名</label>
+    <input type="text" id="f-text" value="${(t.text||"").replace(/"/g,"&quot;")}" placeholder="输入任务...">
+
+    <div class="checks">
+      <label><input type="checkbox" id="f-imp" ${t.important?"checked":""}> 重要</label>
+      <label><input type="checkbox" id="f-urg" ${t.urgent?"checked":""}> 紧急</label>
+      <label><input type="checkbox" id="f-done" ${t.completed?"checked":""}> 已完成</label>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>截止时间</label>
+        <input type="datetime-local" id="f-due" value="${toDatetimeLocal(t.due)}">
+      </div>
+      <div>
+        <label>循环</label>
+        <select id="f-rep">
+          <option value="">不循环</option>
+          <option value="daily"   ${t.repeat==="daily"?"selected":""}>每天</option>
+          <option value="weekly"  ${t.repeat==="weekly"?"selected":""}>每周</option>
+          <option value="monthly" ${t.repeat==="monthly"?"selected":""}>每月</option>
+          <option value="yearly"  ${t.repeat==="yearly"?"selected":""}>每年</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="del" id="f-del" style="${mode==="edit"?"":"visibility:hidden"}">🗑 删除</button>
+      <div style="display:flex;gap:8px;">
+        <button id="f-cancel">取消</button>
+        <button class="save" id="f-save">保存</button>
+      </div>
+    </div>
+  `;
+
+  // 阻止冒泡：点击弹窗内任何地方都不会触发背景关闭
+  m.addEventListener("click", e => e.stopPropagation());
+  m.addEventListener("mousedown", e => e.stopPropagation());
+  m.addEventListener("touchstart", e => e.stopPropagation());
+
+  const close = () => { if (bg.parentNode) bg.parentNode.removeChild(bg); };
+  bg.addEventListener("click", close);
+  m.querySelector("#f-cancel").onclick = (e) => { e.stopPropagation(); close(); };
+
+  m.querySelector("#f-save").onclick = async (e) => {
+    e.stopPropagation();
+    try {
+      const text = m.querySelector("#f-text").value.trim();
+      if (!text) { alert("任务名不能为空"); return; }
+      const imp  = m.querySelector("#f-imp").checked;
+      const urg  = m.querySelector("#f-urg").checked;
+      const dueRaw = m.querySelector("#f-due").value;
+      const due  = dueRaw ? dueRaw.replace("T"," ") : "";
+      const rep  = m.querySelector("#f-rep").value;
+      const completed = m.querySelector("#f-done").checked;
+
+      const newTask = {
+        text, important: imp, urgent: urg,
+        due, repeat: rep, completed,
+        created: t.created || todayStr,
+        modified: mode === "edit" ? todayStr : "",
+        done: completed ? (t.done || todayStr) : "",
+      };
+
+      if (mode === "edit") await writeTaskAtIndex(idx, newTask);
+      else                 await appendTask(newTask);
+      close();
+      // 等文件系统稳定后再刷新
+      setTimeout(() => onSaved && onSaved(), 60);
+    } catch (err) {
+      alert("保存失败：" + err.message);
+      console.error(err);
+    }
+  };
+
+  m.querySelector("#f-del").onclick = async (e) => {
+    e.stopPropagation();
+    if (!confirm("确定删除该任务？")) return;
+    try {
+      await deleteTaskAtIndex(idx);
+      close();
+      setTimeout(() => onSaved && onSaved(), 60);
+    } catch (err) {
+      alert("删除失败：" + err.message);
+    }
+  };
+}
+
+function toDatetimeLocal(s) {
+  if (!s) return "";
+  const m = String(s).match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}))?/);
+  if (!m) return "";
+  return m[1] + "T" + (m[2] || "09:00");
+}
+
+/* ============================================================
+   主渲染
+   ============================================================ */
+const root = dv.container.createEl("div");
+
+// 状态条
+const statusBar = root.createEl("div", { cls: "todo-status" });
+
+// Tabs
+const tabs = root.createEl("div", { cls: "todo-tabs" });
+const tabQ = tabs.createEl("button", { text: "🎯 四象限" });
+const tabC = tabs.createEl("button", { text: "📅 日历" });
+const tabB = tabs.createEl("button", { text: "🪟 双栏" });
+
+// 工具栏
+const toolbar = root.createEl("div", { cls: "todo-toolbar" });
+const btnNew     = toolbar.createEl("button", { cls: "todo-btn primary", text: "➕ 新建任务" });
+const btnRefresh = toolbar.createEl("button", { cls: "todo-btn", text: "🔄 刷新" });
+const btnRecur   = toolbar.createEl("button", { cls: "todo-btn", text: "🔁 续期循环" });
+const btnHide    = toolbar.createEl("button", { cls: "todo-btn", text: "👁 隐藏已完成" });
+
+// 过滤标签栏
+const filterBar = root.createEl("div", { cls: "todo-toolbar" });
+const fAll   = filterBar.createEl("button", { cls:"todo-btn active", text: "全部" });
+const fToday = filterBar.createEl("button", { cls:"todo-btn", text: "今日待办" });
+const fWeek  = filterBar.createEl("button", { cls:"todo-btn", text: "本周待办" });
+const fOver  = filterBar.createEl("button", { cls:"todo-btn", text: "已逾期" });
+
+const content = root.createEl("div");
+
+let currentTab = "both";
+let hideDone = false;
+let currentFilter = "all";
+
+const setTabActive = () => {
+  [tabQ, tabC, tabB].forEach(b => b.classList.remove("active"));
+  ({ q: tabQ, c: tabC, both: tabB }[currentTab]).classList.add("active");
+};
+tabQ.onclick = ()=>{ currentTab="q";    setTabActive(); render(); };
+tabC.onclick = ()=>{ currentTab="c";    setTabActive(); render(); };
+tabB.onclick = ()=>{ currentTab="both"; setTabActive(); render(); };
+setTabActive();
+
+const setFilterActive = () => {
+  [fAll, fToday, fWeek, fOver].forEach(b => b.classList.remove("active"));
+  ({all:fAll, today:fToday, week:fWeek, over:fOver}[currentFilter]).classList.add("active");
+};
+fAll.onclick   = ()=>{ currentFilter="all";   setFilterActive(); render(); };
+fToday.onclick = ()=>{ currentFilter="today"; setFilterActive(); render(); };
+fWeek.onclick  = ()=>{ currentFilter="week";  setFilterActive(); render(); };
+fOver.onclick  = ()=>{ currentFilter="over";  setFilterActive(); render(); };
+
+btnNew.onclick = () => openTaskModal({ mode:"new", onSaved: render });
+btnRefresh.onclick = render;
+btnRecur.onclick = async () => { await runRecurring(); render(); };
+btnHide.onclick = () => {
+  hideDone = !hideDone;
+  btnHide.classList.toggle("active", hideDone);
+  btnHide.textContent = hideDone ? "👁 显示已完成" : "👁 隐藏已完成";
+  render();
+};
+
+let viewYear = todayDV.year;
+let viewMonth = todayDV.month;
+
+/* ---------- 过滤函数 ---------- */
+function applyFilter(tasks) {
+  let list = tasks;
+  if (hideDone) list = list.filter(t => !t.completed);
+  if (currentFilter === "all") return list;
+
+  const todayTs = todayDV.startOf("day").ts;
+  const weekEnd = todayDV.plus({days:7}).ts;
+
+  return list.filter(t => {
+    if (!t.due) return false;
+    const d = dv.date(String(t.due).replace(" ","T"));
+    if (!d) return false;
+    if (currentFilter === "today") {
+      return d.toFormat("yyyy-MM-dd") === todayStr;
+    }
+    if (currentFilter === "week") {
+      return d.ts >= todayTs && d.ts <= weekEnd;
+    }
+    if (currentFilter === "over") {
+      return d.ts < nowDV.ts && !t.completed;
+    }
+    return true;
+  });
+}
+
+/* ---------- 渲染 ---------- */
+async function render() {
+  content.innerHTML = "";
+  statusBar.classList.remove("todo-error");
+
+  let tasks;
+  try {
+    tasks = await loadTasks();
+    statusBar.setText(`✅ 已加载 ${tasks.length} 个任务（来源：${SRC_PATH}）`);
+  } catch (err) {
+    statusBar.classList.add("todo-error");
+    statusBar.setText("❌ " + err.message);
+    return;
+  }
+
+  const filtered = applyFilter(tasks);
+
+  if (currentTab === "q" || currentTab === "both") {
+    await renderQuadrants(content, filtered);
+  }
+  if (currentTab === "c" || currentTab === "both") {
+    if (currentTab === "both") content.createEl("hr");
+    // 日历不应用 today/week 这种过滤（日历需要看全月），但 hideDone 仍生效
+    const calTasks = hideDone ? tasks.filter(t => !t.completed) : tasks;
+    await renderCalendar(content, calTasks);
+  }
+}
+
+/* ---------- 四象限 + 拖拽 ---------- */
+async function renderQuadrants(container, tasks) {
+
+  // 不再过滤 completed，让已完成的也参与象限分类
+
+  const all = tasks; // 已经在外层 applyFilter 处理过 hideDone
+
+  const Q1 = all.filter(t => isImportant(t) &&  (isUrgent(t) || within12h(t)));
+
+  const Q2 = all.filter(t => isImportant(t) && !(isUrgent(t) || within12h(t)));
+
+  const Q3 = all.filter(t => !isImportant(t) &&  (isUrgent(t) || within12h(t)));
+
+  const Q4 = all.filter(t => !isImportant(t) && !(isUrgent(t) || within12h(t)));
+
+  
+
+  // 排序规则：未完成在前 → 各组内部按 due 升序
+
+  const sortGroup = (list) => {
+
+    const open = list.filter(t => !t.completed).sort(byDue);
+
+    const done = list.filter(t =>  t.completed).sort((a,b) => {
+
+      // 已完成的按完成日期倒序（最近完成的排前面）
+
+      const da = a.done ? dv.date(a.done).ts : 0;
+
+      const db = b.done ? dv.date(b.done).ts : 0;
+
+      return db - da;
+
+    });
+
+    return [...open, ...done];
+
+  };
+
+  
+
+  const grid = container.createEl("div", { cls: "q-grid" });
+
+  renderQuadrant(grid, "🟥 Q1 重要 & 紧急",     COLORS.Q1, sortGroup(Q1), "Q1");
+
+  renderQuadrant(grid, "🟧 Q2 重要 & 不紧急",   COLORS.Q2, sortGroup(Q2), "Q2");
+
+  renderQuadrant(grid, "🟨 Q3 紧急 & 不重要",   COLORS.Q3, sortGroup(Q3), "Q3");
+
+  renderQuadrant(grid, "⬜ Q4 不重要 & 不紧急", COLORS.Q4, sortGroup(Q4), "Q4");
+
+}
+
+function renderQuadrant(grid, title, color, list, qid) {
+
+  const box = grid.createEl("div", { cls: "q-box" });
+
+  const head = box.createEl("div", { cls: "q-head" });
+
+  head.style.background = color;
+
+  head.createEl("span", { text: title });
+
+  
+
+  // 头部计数：未完成 / 总数
+
+  const openCount = list.filter(t => !t.completed).length;
+
+  head.createEl("span", { text: `${openCount} / ${list.length}` });
+
+  
+
+  const body = box.createEl("div", { cls: "q-body" });
+
+  body.dataset.qid = qid;
+
+  
+
+  body.addEventListener("dragover", e => { e.preventDefault(); body.classList.add("drop-hover"); });
+
+  body.addEventListener("dragleave", () => body.classList.remove("drop-hover"));
+
+  body.addEventListener("drop", async (e) => {
+
+    e.preventDefault();
+
+    body.classList.remove("drop-hover");
+
+    const idx = Number(e.dataTransfer.getData("text/idx"));
+
+    if (Number.isNaN(idx)) return;
+
+    const targetQ = body.dataset.qid;
+
+    const imp = (targetQ === "Q1" || targetQ === "Q2");
+
+    const urg = (targetQ === "Q1" || targetQ === "Q3");
+
+    const tasks = await loadTasks();
+
+    const t = tasks.find(x => x.idx === idx);
+
+    if (!t) return;
+
+    const newT = { ...t, important: imp, urgent: urg, modified: todayStr };
+
+    await writeTaskAtIndex(idx, newT);
+
+    setTimeout(render, 60);
+
+  });
+
+  
+
+  if (list.length === 0) {
+
+    body.createEl("div", { cls: "q-empty", text: "— 无 —" });
+
+    return;
+
+  }
+
+  
+
+  // 在第一个已完成任务前插入分隔线
+
+  let dividerInserted = false;
+
+  
+
+  for (const t of list) {
+
+    // 当遇到第一个已完成任务时插入分隔线
+
+    if (t.completed && !dividerInserted && list.some(x => !x.completed)) {
+
+      body.createEl("div", { cls: "q-divider", text: "已完成 ↓" });
+
+      dividerInserted = true;
+
+    }
+
+  
+
+    const row = body.createEl("div", { cls: "q-item" + (t.completed?" done":"") });
+
+    row.draggable = true;
+
+    row.addEventListener("dragstart", (e) => {
+
+      e.dataTransfer.setData("text/idx", String(t.idx));
+
+      row.classList.add("dragging");
+
+    });
+
+    row.addEventListener("dragend", () => row.classList.remove("dragging"));
+
+  
+
+    const cb = row.createEl("input", { type: "checkbox", cls: "q-cb" });
+
+    cb.checked = t.completed;
+
+    cb.onchange = async () => {
+
+      const newT = { ...t, completed: cb.checked, done: cb.checked ? todayStr : "" };
+
+      await writeTaskAtIndex(t.idx, newT);
+
+      setTimeout(render, 60);
+
+    };
+
+  
+
+    const main = row.createEl("div", { cls: "q-text" });
+
+    main.createEl("div", { text: t.text });
+
+    const meta = [];
+
+    if (t.due) meta.push(`📅 ${t.due}`);
+
+    if (t.repeat) meta.push(`🔁 ${t.repeat}`);
+
+    if (within12h(t) && !t.completed) meta.push("⚠️ 12h内");
+
+    if (t.completed && t.done) meta.push(`✅ ${t.done}`);
+
+    if (meta.length) main.createEl("div", { cls: "q-meta", text: meta.join("　") });
+
+  
+
+    const edit = row.createEl("button", { cls: "q-edit", text: "✍️" });
+
+    edit.onclick = () => openTaskModal({
+
+      mode:"edit", task:t, idx:t.idx, onSaved: render
+
+    });
+
+  }
+
+}
+
+/* ---------- 日历 ---------- */
+async function renderCalendar(container, tasks) {
+  const nav = container.createEl("div", { cls: "cal-nav" });
+  const prev = nav.createEl("button", { cls:"todo-btn", text: "◀" });
+  const title = nav.createEl("span",  { cls:"cal-title", text: `${viewYear} 年 ${viewMonth} 月` });
+  const next = nav.createEl("button", { cls:"todo-btn", text: "▶" });
+  const tdyB = nav.createEl("button", { cls:"todo-btn", text: "今天" });
+  prev.onclick = () => { viewMonth--; if(viewMonth<1){viewMonth=12;viewYear--;} render(); };
+  next.onclick = () => { viewMonth++; if(viewMonth>12){viewMonth=1;viewYear++;} render(); };
+  tdyB.onclick = () => { viewYear=todayDV.year; viewMonth=todayDV.month; render(); };
+
+  const eventMap = {};
+  for (const t of tasks) {
+    const q = quadrant(t);
+    const color = COLORS[q];
+    const push = (date, prefix) => {
+      if (!date) return;
+      (eventMap[date] ||= []).push({ prefix, text: t.text, color, idx: t.idx, task: t });
+    };
+    push(fmtDate(t.created),  "Start·");
+    push(fmtDate(t.due),      "End·");
+    if (t.completed) push(fmtDate(t.done), "✅·");
+    push(fmtDate(t.modified), "✍️·");
+  }
+
+  const table = container.createEl("table", { cls: "cal-table" });
+  const head = table.createEl("tr");
+  ["一","二","三","四","五","六","日"].forEach(d => head.createEl("th", { text: d }));
+
+  const first = dv.date(`${viewYear}-${pad(viewMonth)}-01`);
+  const startWeekday = first.weekday;
+  const daysInMonth  = first.daysInMonth;
+
+  let row = table.createEl("tr");
+  for (let i = 1; i < startWeekday; i++) row.createEl("td", { cls: "cal-empty" });
+
+  for (let day = 1; day <= daysInMonth; day++) {
+    if ((startWeekday + day - 2) % 7 === 0 && day !== 1) row = table.createEl("tr");
+    const cell = row.createEl("td", { cls: "cal-cell" });
+    const dateStr = `${viewYear}-${pad(viewMonth)}-${pad(day)}`;
+    const isToday = dateStr === todayStr;
+
+    cell.createEl("div", {
+      text: String(day),
+      cls: "cal-day" + (isToday ? " cal-today":"")
+    });
+
+    const events = eventMap[dateStr] || [];
+    for (const ev of events) {
+      const item = cell.createEl("div", { cls: "cal-item" });
+      item.style.background = ev.color;
+      item.setText(`${ev.prefix}${ev.text}`);
+      item.onclick = (e) => {
+        e.stopPropagation();
+        openTaskModal({ mode:"edit", task: ev.task, idx: ev.idx, onSaved: render });
+      };
+    }
+
+    cell.onclick = () => {
+      openTaskModal({ mode:"new", defaultDate: dateStr, onSaved: render });
+    };
+  }
+}
+
+/* ---------- 循环续期（含每年） ---------- */
+async function runRecurring() {
+  const { file, lines } = await readInbox();
+  let changed = false;
+  const newLines = [];
+  const nextDate = (dateStr, rule) => {
+    const d = dv.date(String(dateStr).slice(0,10));
+    if (!d) return null;
+    if (rule === "daily")   return d.plus({days:1}).toFormat("yyyy-MM-dd");
+    if (rule === "weekly")  return d.plus({weeks:1}).toFormat("yyyy-MM-dd");
+    if (rule === "monthly") return d.plus({months:1}).toFormat("yyyy-MM-dd");
+    if (rule === "yearly")  return d.plus({years:1}).toFormat("yyyy-MM-dd");
+    return null;
+  };
+
+  for (let line of lines) {
+    const parsed = parseTaskLine(line);
+    if (parsed && parsed.completed && parsed.repeat && !line.includes("[spawned::")) {
+      const newDue = nextDate(parsed.due, parsed.repeat);
+      if (newDue) {
+        line = line.replace(/\s*$/, " [spawned:: true]");
+        newLines.push(line);
+        const timePart = String(parsed.due).length > 10 ? " " + String(parsed.due).slice(11) : "";
+        const next = {
+          ...parsed,
+          completed:false, done:"", modified:"",
+          created: todayStr,
+          due: newDue + timePart,
+        };
+        newLines.push(buildTaskLine(next));
+        changed = true;
+        continue;
+      }
+    }
+    newLines.push(line);
+  }
+  if (changed) await app.vault.modify(file, newLines.join("\n"));
+}
+
+/* ---------- 启动 ---------- */
+render();
+```
